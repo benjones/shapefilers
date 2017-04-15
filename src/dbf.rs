@@ -3,39 +3,37 @@
 use std::error::Error;
 use byteorder::{ByteOrder, LittleEndian};
 use std::ops::Index;
+use std::rc::Rc;
 
 
-pub struct DBF<'a> {
+pub struct DBF {
     last_modified: Date,
-    fields: Vec<FieldDescriptor>,
-    records: Vec<Record<'a>>,
+    fields: Rc<Vec<FieldDescriptor>>,
+    records: Vec<Record>,
 }
 
 #[derive(Debug)]
 pub struct FieldDescriptor {
     pub name: String,
     pub field_type: u8, //ascii char
-    //not sure what the other fields mean...
     pub field_length: u8,
     pub field_start: u16,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Date {
     pub year: u32,
     pub month: u8,
     pub day: u8,
 }
-pub struct RecordData {
-    data: Vec<u8>,
-}
 
-pub struct Record<'a> {
+pub struct Record {
     data: Vec<u8>,
-    parent: &'a DBF<'a>
+    fields: Rc<Vec<FieldDescriptor>>,
 }
 
 
-
+#[derive(Debug, PartialEq)]
 pub enum RecordField {
     Text(String),
     Number(f64),
@@ -44,7 +42,7 @@ pub enum RecordField {
 }
 
 
-impl <'a> DBF<'a> {
+impl DBF {
     pub fn from_file(filename: &str) -> Result<Self, Box<Error>> {
         use std::fs::File;
         use std::io::prelude::*;
@@ -89,52 +87,72 @@ impl <'a> DBF<'a> {
             field_byte_offset += field_length as u16;
         }
         let records = Vec::with_capacity(num_records as usize);
-        //seek to the start of the records
+
 
         let mut dbf = DBF {
             last_modified: date,
-            fields: fields,
+            fields: Rc::new(fields),
             records: records,
         };
-
-        f.seek(SeekFrom::Start(num_header_bytes as u64))?;
+        //seek to the start of the records
+        f.seek(SeekFrom::Start(num_header_bytes as u64 + 1))?;
         for _ in 0..num_records {
             //create uninitialized buffer
             let mut record_buf = Vec::with_capacity(bytes_per_record as usize);
             unsafe { record_buf.set_len(bytes_per_record as usize) };
             f.read_exact(&mut record_buf)?;
-            dbf.records.push(Record { data: record_buf, parent : &dbf});
+            dbf.records
+                .push(Record {
+                          data: record_buf,
+                          fields: dbf.fields.clone(),
+                      });
         }
 
 
         Ok(dbf)
     }
 
+    pub fn last_modified(&self) -> &Date {
+        &self.last_modified
+    }
+
     pub fn fields(&self) -> &[FieldDescriptor] {
         self.fields.as_slice()
     }
 
+    pub fn num_fields(&self) -> usize {
+        self.fields.len()
+    }
+
     pub fn iter_records(&self) -> RecordsIterator {
-        RecordsIterator{parent : self, index : 0}
+        RecordsIterator {
+            parent: self,
+            index: 0,
+        }
     }
 }
-//
-//impl <'a> Index<usize> for DBF{
-//    type Output = Record<'a>;
-//    fn index(&'a self, index : usize) -> Self::Output {
-//        Record{data : self.recordData[index], fields: self.fields.as_slice()}
-//    }
-//}
 
-pub struct RecordsIterator<'a> {
-    parent: &'a DBF<'a>,
-    index : usize
+impl Index<usize> for DBF {
+    type Output = Record;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.records[index]
+    }
 }
 
-impl <'a> Iterator for RecordsIterator<'a>{
-    type Item = Record<'a>;
+pub struct RecordsIterator<'a> {
+    parent: &'a DBF,
+    index: usize,
+}
+
+impl<'a> Iterator for RecordsIterator<'a> {
+    type Item = &'a Record;
     fn next(&mut self) -> Option<Self::Item> {
-        None
+        if self.index < self.parent.records.len() {
+            self.index += 1;
+            Some(&self.parent[self.index - 1])
+        } else {
+            None
+        }
     }
 }
 
@@ -171,36 +189,47 @@ fn parse_date_text(buffer: &[u8]) -> Date {
     }
 }
 
-impl<'a> Record<'a> {
+impl Record {
     pub fn field_by_index(&self, index: usize) -> RecordField {
         use std::str;
-        let &fields = &self.parent.fields;
+        let ref fields = self.fields;
         let start = fields[index].field_start as usize;
         let end = start + fields[index].field_length as usize;
 
         let field_slice = &self.data[start..end];
 
         match fields[index].field_type {
-            b'C' | b'M'=> unsafe { RecordField::Text(
-                String::from(str_from_u8_ws_padded(field_slice))) },
+            b'C' | b'M' => {
+                unsafe {
+                    RecordField::Text(String::from(str_from_u8_ws_padded(field_slice).trim()))
+                }
+            }
+
             b'D' => RecordField::Date(parse_date_text(field_slice)),
-            b'F' | b'N' => unsafe { RecordField::Number(
-                str_from_u8_ws_padded(field_slice).parse().unwrap())},
-            b'L' => RecordField::Bool(field_slice[0] == b'Y' ||
-                                      field_slice[0] == b'y' ||
-                                      field_slice[0] == b'T' ||
-                                      field_slice[0] == b't'),
-            _  => panic!()
-            
+            b'F' | b'N' => unsafe {
+                RecordField::Number(str_from_u8_ws_padded(field_slice)
+                                        .trim()
+                                        .parse()
+                                        .unwrap())
+
+            },
+            b'L' => {
+                RecordField::Bool(field_slice[0] == b'Y' || field_slice[0] == b'y' ||
+                                  field_slice[0] == b'T' ||
+                                  field_slice[0] == b't')
+            }
+            _ => panic!(),
+
         }
     }
 
     pub fn field_by_name(&self, field_name: &str) -> Option<RecordField> {
-        let field_index = self.parent.fields.iter().position(|ref s| s.name == field_name);
+        let field_index = self.fields
+            .iter()
+            .position(|ref s| s.name == field_name);
         field_index.map(|i| self.field_by_index(i))
     }
 }
-
 
 
 #[cfg(test)]
@@ -213,17 +242,24 @@ mod tests {
         assert_eq!(dbf.last_modified.month, 2);
         assert_eq!(dbf.last_modified.day, 17);
 
-        let fields = dbf.fields;
-
-        for f in &fields {
+        for f in dbf.fields.iter() {
             println!("field: {:?}", f);
         }
 
-        assert_eq!(fields.len(), 9);
-        assert_eq!(fields[0].name, "STATEFP");
-        assert_eq!(fields[0].field_type, b'C');
+        assert_eq!(dbf.fields.len(), 9);
+        assert_eq!(dbf.fields[0].name, "STATEFP");
+        assert_eq!(dbf.fields[0].field_type, b'C');
 
-        
+        assert_eq!(dbf[25].field_by_name("NAME").unwrap(),
+                   RecordField::Text(String::from("Colorado")));
+
+        for rec in dbf.iter_records().take(5) {
+            for i in 0..dbf.num_fields() {
+                println!("field number {} : {:?}", i, rec.field_by_index(i));
+            }
+        }
+
+
     }
 
 }
