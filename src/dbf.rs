@@ -2,13 +2,13 @@
 
 use std::error::Error;
 use byteorder::{ByteOrder, LittleEndian};
+use std::ops::Index;
 
 
-
-pub struct ShapeFile {
+pub struct DBF<'a> {
     last_modified: Date,
     fields: Vec<FieldDescriptor>,
-    records: Vec<RecordData>,
+    records: Vec<Record<'a>>,
 }
 
 #[derive(Debug)]
@@ -30,9 +30,11 @@ pub struct RecordData {
 }
 
 pub struct Record<'a> {
-    data: &'a RecordData,
-    fields: &'a [FieldDescriptor],
+    data: Vec<u8>,
+    parent: &'a DBF<'a>
 }
+
+
 
 pub enum RecordField {
     Text(String),
@@ -42,7 +44,7 @@ pub enum RecordField {
 }
 
 
-impl ShapeFile {
+impl <'a> DBF<'a> {
     pub fn from_file(filename: &str) -> Result<Self, Box<Error>> {
         use std::fs::File;
         use std::io::prelude::*;
@@ -89,7 +91,7 @@ impl ShapeFile {
         let records = Vec::with_capacity(num_records as usize);
         //seek to the start of the records
 
-        let mut sf = ShapeFile {
+        let mut dbf = DBF {
             last_modified: date,
             fields: fields,
             records: records,
@@ -101,17 +103,41 @@ impl ShapeFile {
             let mut record_buf = Vec::with_capacity(bytes_per_record as usize);
             unsafe { record_buf.set_len(bytes_per_record as usize) };
             f.read_exact(&mut record_buf)?;
-            sf.records.push(RecordData { data: record_buf });
+            dbf.records.push(Record { data: record_buf, parent : &dbf});
         }
 
 
-        Ok(sf)
+        Ok(dbf)
     }
 
     pub fn fields(&self) -> &[FieldDescriptor] {
         self.fields.as_slice()
     }
+
+    pub fn iter_records(&self) -> RecordsIterator {
+        RecordsIterator{parent : self, index : 0}
+    }
 }
+//
+//impl <'a> Index<usize> for DBF{
+//    type Output = Record<'a>;
+//    fn index(&'a self, index : usize) -> Self::Output {
+//        Record{data : self.recordData[index], fields: self.fields.as_slice()}
+//    }
+//}
+
+pub struct RecordsIterator<'a> {
+    parent: &'a DBF<'a>,
+    index : usize
+}
+
+impl <'a> Iterator for RecordsIterator<'a>{
+    type Item = Record<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
 
 //via https://stackoverflow.com/questions/42066381/
 //how-to-get-a-str-from-a-nul-terminated-byte-slice-if-the-nul-terminator-isnt
@@ -148,12 +174,13 @@ fn parse_date_text(buffer: &[u8]) -> Date {
 impl<'a> Record<'a> {
     pub fn field_by_index(&self, index: usize) -> RecordField {
         use std::str;
-        let start = self.fields[index].field_start as usize;
-        let end = start + self.fields[index].field_length as usize;
+        let &fields = &self.parent.fields;
+        let start = fields[index].field_start as usize;
+        let end = start + fields[index].field_length as usize;
 
-        let field_slice = &self.data.data[start..end];
+        let field_slice = &self.data[start..end];
 
-        match self.fields[index].field_type {
+        match fields[index].field_type {
             b'C' | b'M'=> unsafe { RecordField::Text(
                 String::from(str_from_u8_ws_padded(field_slice))) },
             b'D' => RecordField::Date(parse_date_text(field_slice)),
@@ -167,6 +194,11 @@ impl<'a> Record<'a> {
             
         }
     }
+
+    pub fn field_by_name(&self, field_name: &str) -> Option<RecordField> {
+        let field_index = self.parent.fields.iter().position(|ref s| s.name == field_name);
+        field_index.map(|i| self.field_by_index(i))
+    }
 }
 
 
@@ -176,12 +208,12 @@ mod tests {
     use super::*;
     #[test]
     fn dbf_test() {
-        let sf = ShapeFile::from_file("test_inputs/test_dbf.dbf").unwrap();
-        assert_eq!(sf.last_modified.year, 2016);
-        assert_eq!(sf.last_modified.month, 2);
-        assert_eq!(sf.last_modified.day, 17);
+        let dbf = DBF::from_file("test_inputs/test_dbf.dbf").unwrap();
+        assert_eq!(dbf.last_modified.year, 2016);
+        assert_eq!(dbf.last_modified.month, 2);
+        assert_eq!(dbf.last_modified.day, 17);
 
-        let fields = sf.fields;
+        let fields = dbf.fields;
 
         for f in &fields {
             println!("field: {:?}", f);
@@ -190,6 +222,8 @@ mod tests {
         assert_eq!(fields.len(), 9);
         assert_eq!(fields[0].name, "STATEFP");
         assert_eq!(fields[0].field_type, b'C');
+
+        
     }
 
 }
