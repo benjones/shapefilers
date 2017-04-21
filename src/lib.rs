@@ -1,7 +1,7 @@
 
 pub mod dbf;
-
-extern crate byteorder;
+pub mod shapefile;
+#[macro_use] extern crate enum_primitive;
 
 #[cfg(test)]
 mod tests {

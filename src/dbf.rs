@@ -1,7 +1,8 @@
 
 
 use std::error::Error;
-use byteorder::{ByteOrder, LittleEndian};
+extern crate byteorder;
+use self::byteorder::{ByteOrder, LittleEndian};
 use std::ops::Index;
 use std::rc::Rc;
 
